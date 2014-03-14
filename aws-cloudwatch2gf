@@ -1,0 +1,508 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long qw(:config posix_default no_ignore_case no_ignore_case_always);
+use Pod::Usage;
+use Data::Dumper;
+$Data::Dumper::Indent   = 1;
+$Data::Dumper::Deepcopy = 1;
+$Data::Dumper::Sortkeys = 1;
+$Data::Dumper::Terse    = 1;
+
+use Data::Validator;
+use Smart::Args;
+use Log::Minimal;
+use Carp;
+
+use Net::GrowthForecast;
+use AWS::CLIWrapper;
+use Time::Piece;
+use Time::Seconds;
+use Furl;
+
+my $Interval  = 60;
+my $Exit_Loop = 0;
+my $Update_Graph_Metadata_Interval = 60 * 30;
+my $Last_Update_Graph_Metadata     = 0;
+
+my $Debug = 0;
+
+sub p(@) {
+    my $d =  Dumper(\@_);
+    $d    =~ s/x{([0-9a-z]+)}/chr(hex($1))/ge;
+    print $d;
+}
+
+my $GF_HOST = '127.0.0.1';
+my $GF_PORT = '5125';
+
+my $_AWS;
+sub aws() {
+    $_AWS ||= AWS::CLIWrapper->new;
+    return $_AWS;
+}
+my $_AWS_BILLING;
+sub aws_billing() {
+    $_AWS_BILLING ||= AWS::CLIWrapper->new(region => 'us-east-1');
+    return $_AWS_BILLING;
+}
+
+my $_GF;
+sub gf() {
+    $_GF ||= Net::GrowthForecast->new(
+        host => $GF_HOST,
+        port => $GF_PORT,
+       );
+    return $_GF;
+}
+
+my @ELB_METRICS = (
+    {
+        name        => 'RequestCount',
+        statistics  => 'Sum',
+        mode        => 'gauge',
+        color       => '#00CF00',
+        description => 'req/min',
+        sort        => 10,
+        type        => 'AREA',
+    },
+    {
+        name        => 'HTTPCode_Backend_2XX',
+        statistics  => 'Sum',
+        mode        => 'gauge',
+        color       => '#00CF00',
+        description => 'count/min',
+    },
+    {
+        name        => 'HTTPCode_Backend_3XX',
+        statistics  => 'Sum',
+        mode        => 'gauge',
+        color       => '#119511',
+        description => 'count/min',
+    },
+    {
+        name        => 'HTTPCode_Backend_4XX',
+        statistics  => 'Sum',
+        mode        => 'gauge',
+        color       => '#CF8A00',
+        description => 'count/min',
+    },
+    {
+        name        => 'HTTPCode_Backend_5XX',
+        statistics  => 'Sum',
+        mode        => 'gauge',
+        color       => '#CF0045',
+        description => 'count/min',
+    },
+    {
+        name        => 'HTTPCode_ELB_4XX',
+        statistics  => 'Sum',
+        mode        => 'gauge',
+        color       => '#9D6C08',
+        description => 'count/min',
+    },
+    {
+        name        => 'HTTPCode_ELB_5XX',
+        statistics  => 'Sum',
+        mode        => 'gauge',
+        color       => '#9D083A',
+        description => 'count/min',
+    },
+    {
+        name        => 'Latency',
+        statistics  => 'Average',
+        adjuster    => sub { $_[0] * 1000 }, # sec -> msec
+        mode        => 'gauge',
+        color       => '#00CFCF',
+        description => 'average/min',
+        sort        => 9,
+        type        => 'LINE1',
+        adjust      => '/',
+        adjustval   => 1000,
+    },
+   );
+my %ELB_METRICS_BY_NAME = map { $_->{name} => $_ } @ELB_METRICS;
+
+my @BILLING_METRICS = (
+    {
+        name        => 'AmazonEC2',
+        statistics  => 'Maximum',
+        mode        => 'gauge',
+        color       => '#FF9900',
+        description => 'USD',
+    },
+    {
+        name        => 'AWSSupportBusiness',
+        statistics  => 'Maximum',
+        mode        => 'gauge',
+        color       => '#A228D6',
+        description => 'USD',
+    },
+    {
+        name        => 'AWSDataTransfer',
+        statistics  => 'Maximum',
+        mode        => 'gauge',
+        color       => '#00CF00',
+        description => 'USD',
+    },
+    {
+        name        => 'AmazonRoute53',
+        statistics  => 'Maximum',
+        mode        => 'gauge',
+        color       => '#0087bc',
+        description => 'USD',
+    },
+    {
+        name        => 'AmazonS3',
+        statistics  => 'Maximum',
+        mode        => 'gauge',
+        color       => '#c90f06',
+        description => 'USD',
+    },
+    {
+        name        => 'AmazonSNS',
+        statistics  => 'Maximum',
+        mode        => 'gauge',
+        color       => '#81c906',
+        description => 'USD',
+    },
+   );
+my %BILLING_METRICS_BY_NAME = map { $_->{name} => $_ } @BILLING_METRICS;
+
+MAIN: {
+    my %arg;
+    GetOptions(\%arg,
+               'interval|i=i',
+               'host=s',
+               'port=i',
+               '1'        => sub { $Exit_Loop = 1 },
+               'debug|d+' => \$Debug,
+               'help|h|?' => sub { pod2usage(-verbose=>1) }) or pod2usage();
+    $ENV{LM_DEBUG} = 1 if $Debug;
+    my $opt = Data::Validator->new(
+        interval => { isa => 'Num', default => $Interval },
+        host     => { isa => 'Str', default => $GF_HOST },
+        port     => { isa => 'Int', default => $GF_PORT },
+       )->validate(%arg);
+    debugf("opt: %s", ddf($opt));
+
+    $Interval = $opt->{interval};
+    $GF_HOST  = $opt->{host};
+    $GF_PORT  = $opt->{port};
+
+    debugf("Interval: %s", $Interval);
+    debugf("Exit_Loop: %s", $Exit_Loop);
+    debugf("GF_HOST:GF_PORT: %s:%s", $GF_HOST, $GF_PORT);
+
+    while (1) {
+        ### ELB
+        my @lb_names = list_loadbalancername();
+        debugf("lb_names: %s", join(' ', @lb_names));
+        post_elb_metrics(lb_names => \@lb_names);
+
+        ### Billing
+        post_billing_metrics();
+
+        ### Update graph metadata (periodically)
+        if (time() - $Last_Update_Graph_Metadata > $Update_Graph_Metadata_Interval) {
+            $Last_Update_Graph_Metadata = time();
+
+            update_graph_metadata(lb_names => \@lb_names);
+        }
+
+        last if $Exit_Loop;
+        sleep $Interval;
+    }
+
+    exit 0;
+}
+
+sub list_loadbalancername {
+    my %lb_name;
+
+    my $res = aws->cloudwatch('list-metrics', {
+        namespace   => 'AWS/ELB',
+        dimensions  => { name => 'LoadBalancerName' },
+        metric_name => 'RequestCount',
+    })
+        or do {
+            carp sprintf("Code   : %s\nMessage: %s",
+                         $AWS::CLIWrapper::Error->{Code},
+                         $AWS::CLIWrapper::Error->{Message},
+                        );
+            return;
+        };
+
+    for my $metric (@{ ref($res) eq 'ARRAY' ? $res : $res->{Metrics} }) {
+        for my $dimension (@{ $metric->{Dimensions} }) {
+            if ($dimension->{Name} eq 'LoadBalancerName') {
+                $lb_name{ $dimension->{Value} }++;
+                last;
+            }
+        }
+    }
+
+    return sort keys %lb_name;
+}
+
+sub post_elb_metrics {
+    args(
+         my $lb_names => { isa => 'ArrayRef' },
+        );
+    debugf("post_elb_metrics");
+    my $res;
+
+    for my $lb_name (@$lb_names) {
+        debugf("lb_name: %s", $lb_name);
+
+        for my $metric (@ELB_METRICS) {
+            my $data = 0;
+            my $now = gmtime;
+
+            $res = aws->cloudwatch('get-metric-statistics', {
+                statistics  => $metric->{statistics},
+                namespace   => 'AWS/ELB',
+                period      => 60,
+                metric_name => $metric->{name},
+                start_time  => +($now - ONE_MINUTE * 5)->datetime,
+                end_time    => $now->datetime,
+                dimensions => { name => 'LoadBalancerName', value => $lb_name },
+            })
+                or do {
+                    carp sprintf("Code   : %s\nMessage: %s",
+                                 $AWS::CLIWrapper::Error->{Code},
+                                 $AWS::CLIWrapper::Error->{Message},
+                                );
+                    return;
+                };
+
+            for my $dp (sort {$b->{Timestamp} cmp $a->{Timestamp} }
+                            @{ $res->{Datapoints} }) {
+                debugf("ts: %s", ddf( $dp ));
+                # store latest metric value
+                $data = $dp->{ $metric->{statistics} };
+                if ($metric->{adjuster} && ref($metric->{adjuster}) eq 'CODE') {
+                    $data = $metric->{adjuster}->($data);
+                }
+                last;
+            }
+
+            gf->post('ELB', $lb_name, $metric->{name},
+                     int($data),
+                     mode => $metric->{mode},
+                    );
+        }
+    }
+}
+
+sub post_billing_metrics {
+    debugf("post_billing_metrics");
+    my $res;
+
+    for my $metric (@BILLING_METRICS) {
+        my $data = 0;
+        my $now = gmtime;
+
+        $res = aws_billing->cloudwatch('get-metric-statistics', {
+            statistics  => $metric->{statistics},
+            namespace   => 'AWS/Billing',
+            period      => 60,
+            metric_name => 'EstimatedCharges',
+            start_time  => +($now - ONE_HOUR * 5)->datetime,
+            end_time    => $now->datetime,
+            dimensions => [
+                { name => 'Currency', value => 'USD' },
+                { name => 'ServiceName', value => $metric->{name} },
+               ],
+        })
+            or do {
+                carp sprintf("Code   : %s\nMessage: %s",
+                             $AWS::CLIWrapper::Error->{Code},
+                             $AWS::CLIWrapper::Error->{Message},
+                            );
+                return;
+            };
+
+        for my $dp (sort {$b->{Timestamp} cmp $a->{Timestamp} }
+                        @{ $res->{Datapoints} }) {
+            debugf("ts: %s", ddf( $dp ));
+            # store latest metric value
+            $data = $dp->{ $metric->{statistics} };
+            if ($metric->{adjuster} && ref($metric->{adjuster}) eq 'CODE') {
+                $data = $metric->{adjuster}->($data);
+            }
+            last;
+        }
+
+        gf->post('Billing', 'bn-aws', $metric->{name},
+                 int($data),
+                 mode => $metric->{mode},
+                );
+    }
+}
+
+sub update_graph_metadata {
+    args(
+         my $lb_names => { isa => 'ArrayRef' },
+        );
+    debugf("update_graph_metadata");
+
+    my $graphs = gf->tree();
+    #p $graphs;
+
+    ### ELB
+    my $elb_graphs = $graphs->{ELB};
+    for my $elb_name (keys %$elb_graphs) {
+        for my $graph_name (keys %{ $elb_graphs->{$elb_name} }) {
+            my $g = $elb_graphs->{$elb_name}{$graph_name};
+
+            if (my $md = $ELB_METRICS_BY_NAME{$graph_name}) {
+                for my $n (qw(description color sort type adjust adjustval)) {
+                    next unless exists $md->{$n};
+                    $g->{$n} = $md->{$n};
+                }
+                gf->edit($g);
+            }
+        }
+
+        if (! $elb_graphs->{$elb_name}{Backend_Error}) {
+            my @cg = qw(
+                           HTTPCode_Backend_5XX
+                           HTTPCode_Backend_4XX
+                           HTTPCode_Backend_3XX
+                      );
+            gf->add_complex('ELB', $elb_name, 'Backend_Error',
+                            'HTTP Error (backend), count/min',
+                            0,  # sumup
+                            19,  # sort
+                            'AREA',
+                            'gauge',
+                            1,  # stack
+                            ( map {$_->{id}} @{$elb_graphs->{$elb_name}}{@cg} ),
+                           );
+        }
+        if (! $elb_graphs->{$elb_name}{ELB_Error}) {
+            my @cg = qw(
+                           HTTPCode_ELB_5XX
+                           HTTPCode_ELB_4XX
+                      );
+            gf->add_complex('ELB', $elb_name, 'ELB_Error',
+                            'HTTP Error (ELB), count/min',
+                            0,  # sumup
+                            18,  # sort
+                            'AREA',
+                            'gauge',
+                            1,  # stack
+                            ( map {$_->{id}} @{$elb_graphs->{$elb_name}}{@cg} ),
+                           );
+        }
+
+    }
+
+    ### Billing
+    my $billing_graphs = $graphs->{Billing};
+    for my $account_name (keys %$billing_graphs) {
+        for my $graph_name (keys %{ $billing_graphs->{$account_name} }) {
+            my $g = $billing_graphs->{$account_name}{$graph_name};
+
+            if (my $md = $BILLING_METRICS_BY_NAME{$graph_name}) {
+                for my $n (qw(description color sort type)) {
+                    next unless exists $md->{$n};
+                    $g->{$n} = $md->{$n};
+                }
+                gf->edit($g);
+            }
+        }
+
+        if (! $billing_graphs->{$account_name}{Total}) {
+            my @cg = qw(
+                           AmazonEC2
+                           AWSSupportBusiness
+                           AWSDataTransfer
+                           AmazonRoute53
+                           AmazonS3
+                           AmazonSNS
+                      );
+            gf->add_complex('Billing', $account_name, 'Summary',
+                            '',
+                            1,  # sumup
+                            19,  # sort
+                            'AREA',
+                            'gauge',
+                            1,  # stack
+                            ( map {$_->{id}} @{$billing_graphs->{$account_name}}{@cg} ),
+                           );
+        }
+    }
+
+}
+
+__END__
+
+=head1 NAME
+
+B<aws-cloudwatch2gf> - fetch metrics from CloudWatch and post to GrowthForecast
+
+=head1 SYNOPSIS
+
+B<aws-cloudwatch2gf>
+[B<-i> I<interval>]
+[B<--host> I<gf_host>]
+[B<--port> I<gf_port>]
+[B<-1>]
+[B<-d> | B<--debug>]
+
+B<aws-cloudwatch2gf> B<-h> | B<--help> | B<-?>
+
+  $ aws-cloudwatch2gf
+
+=head1 DESCRIPTION
+
+fetch metrics from CloudWatch and post to GrowthForecast
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-i> I<interval>, B<--interval> I<interval>
+
+Default is 60
+
+=item B<--host> I<gf_host>
+
+Default is 127.0.0.1
+
+=item B<--port> I<gf_port>
+
+Default is 5125
+
+=item B<-1>
+
+Don't loop. (for debugging)
+
+=item B<-d>, B<--debug>
+
+increase debug level.
+-d -d more verbosely.
+
+=back
+
+=head1 AUTHOR
+
+HIROSE, Masaaki E<lt>hirose31@gmail.com<gt>
+
+=cut
+
+# for Emacsen
+# Local Variables:
+# mode: cperl
+# cperl-indent-level: 4
+# cperl-close-paren-offset: -4
+# cperl-indent-parens-as-block: t
+# indent-tabs-mode: nil
+# coding: utf-8
+# End:
+
+# vi: set ts=4 sw=4 sts=0 et ft=perl fenc=utf-8 :
